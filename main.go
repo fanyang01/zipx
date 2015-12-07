@@ -19,12 +19,41 @@ import (
 )
 
 var (
-	uncompress = flag.Bool("x", false, "uncompress")
-	dir        = flag.String("d", "", "create a `dir`ectory and change to it")
-	charset    = flag.String("c", "UTF-8", "`charset` of zip file, support UTF-8 and GBK")
-	verbose    = flag.Bool("v", false, "verbosely")
-	logv       *logger
+	compress bool
+	dir      string
+	charset  string
+	verbose  bool
+	logv     *logger
 )
+
+func init() {
+	flag.BoolVar(&compress, "z", false, "compress")
+	flag.StringVar(&dir, "d", ".", "create a `dir`ectory to place uncompressed files")
+	flag.StringVar(&charset, "c", "UTF-8", "`charset` of zip file, UTF-8 or GBK")
+	flag.BoolVar(&verbose, "v", false, "verbosely")
+	flag.Usage = func() {
+		name := os.Args[0]
+		fmt.Fprintf(os.Stderr, "USAGE\n")
+		fmt.Fprintf(os.Stderr, "  uncompress: %s [OPTIONS] [ZIPFILE]\n", name)
+		fmt.Fprintf(os.Stderr, "    compress: %s -z [OPTIONS] [ZIPFILE] FILE...\n", name)
+		fmt.Fprintf(os.Stderr, "\nOPTIONS\n")
+		flag.PrintDefaults()
+	}
+
+	flag.Parse()
+
+	logv = &logger{
+		V: verbose,
+	}
+	log.SetFlags(log.Lshortfile)
+
+	charset = strings.ToUpper(charset)
+	switch charset {
+	case "UTF-8", "GBK":
+	default:
+		log.Fatal("unsupported charset: " + charset)
+	}
+}
 
 type logger struct {
 	V bool
@@ -43,41 +72,18 @@ func fatalIf(err error) {
 }
 
 func main() {
-	flag.Usage = func() {
-		name := os.Args[0]
-		fmt.Fprintf(os.Stderr, "%s - compress/uncompress\n\n", name)
-		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "\t%s path [ZIPFILE]\n", name)
-		fmt.Fprintf(os.Stderr, "\t%s -x [-d DIR] ZIPFILE\n\n", name)
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-	log.SetFlags(log.Lshortfile)
-	logv = &logger{
-		V: *verbose,
-	}
-
-	if !*uncompress {
-		switch flag.NArg() {
-		case 1:
-			abs, err := filepath.Abs(flag.Arg(0))
-			if err != nil {
-				log.Fatal(err)
-			}
-			zipDir(flag.Arg(0), filepath.Base(abs)+".zip")
-		case 2:
-			zipDir(flag.Arg(0), flag.Arg(1))
-		default:
-			flag.Usage()
-			os.Exit(1)
-		}
+	if compress {
+		Zip()
 		return
 	}
+	Unzip()
+}
 
+func Unzip() {
 	var r io.Reader
 	switch flag.NArg() {
-	// case 0:
-	// 	r = os.Stdin
+	case 0:
+		r = os.Stdin
 	case 1:
 		f, err := os.Open(flag.Arg(0))
 		if err != nil {
@@ -90,14 +96,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	logv.Info("Encoding: %s\n", strings.ToUpper(*charset))
-	switch strings.ToLower(*charset) {
-	case "utf-8", "gbk":
-	default:
-		log.Fatal("unsupported charset: " + *charset)
-	}
+	logv.Info("Charset: %s\n", charset)
 
-	// TODO: how to handle big file?
+	// TODO: handle big file
 	b, err := ioutil.ReadAll(r)
 	if err != nil {
 		log.Fatal(err)
@@ -110,13 +111,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	dest := "."
-	if *dir != "" {
-		err := os.MkdirAll(*dir, 0755)
-		if err != nil {
-			log.Fatal(err)
-		}
-		dest = *dir
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Fatal(err)
 	}
 
 	extract := func(f *zip.File) {
@@ -127,34 +123,33 @@ func main() {
 		defer rc.Close()
 
 		name := f.Name
-		switch strings.ToLower(*charset) {
-		case "utf-8":
-		case "gbk":
+		// convert to UTF-8 from other charset.
+		switch charset {
+		case "GBK":
 			name, _, err = transform.String(simplifiedchinese.GBK.NewDecoder(), name)
 			if err != nil {
 				log.Fatal(err)
 			}
 		}
 
-		path := filepath.Join(dest, name)
+		path := filepath.Join(dir, name)
 		if f.FileInfo().IsDir() {
-			logv.Info("Create directory %s\n", path)
-			err := os.MkdirAll(path, f.Mode())
-			if err != nil {
+			logv.Info("Create directory: %s\n", path)
+			if err := os.MkdirAll(path, f.Mode()); err != nil {
 				log.Fatal(err)
 			}
 		} else {
-			logv.Info("Write to file %s\n", path)
+			logv.Info("Write to file: %s\n", path)
 			file, err := os.OpenFile(
 				path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
 			if err != nil {
 				log.Fatal(err)
 			}
-			_, err = io.Copy(file, rc)
-			if err != nil {
+			defer file.Close()
+
+			if _, err = io.Copy(file, rc); err != nil {
 				log.Fatal(err)
 			}
-			file.Close()
 		}
 	}
 
@@ -163,51 +158,82 @@ func main() {
 	}
 }
 
-func zipDir(pth, dst string) {
-	file, err := os.OpenFile(
+func Zip() {
+	var pth, dst string
+	switch flag.NArg() {
+	case 0:
+		pth = "."
+	case 1:
+		pth = flag.Arg(0)
+	case 2:
+		pth, dst = flag.Arg(0), flag.Arg(1)
+	default:
+		flag.Usage()
+		os.Exit(1)
+	}
+	if dst == "" {
+		abs, err := filepath.Abs(flag.Arg(0))
+		if err != nil {
+			log.Fatal(err)
+		}
+		dst = filepath.Base(abs) + ".zip"
+	}
+	zzip(pth, dst)
+	return
+
+}
+
+func zzip(pth, dst string) {
+	zf, err := os.OpenFile(
 		dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		log.Fatal(err)
 	}
-	dstAbs, err := filepath.Abs(dst)
+	defer zf.Close()
+
+	zstat, err := zf.Stat()
 	if err != nil {
 		log.Fatal(err)
 	}
-	buf := bufio.NewWriter(file)
 
-	var gbk bool
-	switch strings.ToLower(*charset) {
-	case "utf-8":
-	case "gbk":
-		gbk = true
-	default:
-		log.Fatal("unsupported charset: " + *charset)
-	}
+	buf := bufio.NewWriter(zf)
 	// Create a new zip archive.
 	w := zip.NewWriter(buf)
 
 	var walk func(string, string)
-	walk = func(p, pname string) {
-		logv.Info("%s\n", p)
-		f, err := os.Open(p)
+
+	walk = func(full, base string) {
+		f, err := os.Open(full)
 		if err != nil {
 			log.Fatal(err)
 		}
+		// this function may be called recursively
+		// defer f.Close()
+
 		fi, err := f.Stat()
 		if err != nil {
 			log.Fatal(err)
 		}
-		if gbk {
-			pname, _, err = transform.String(simplifiedchinese.GBK.NewEncoder(), pname)
-			if err != nil {
-				log.Fatal(err)
-			}
+		// could NOT include the zip file itself.
+		if os.SameFile(zstat, fi) {
+			f.Close()
+			return
 		}
+		logv.Info("Add %s\n", full)
+
 		header, err := zip.FileInfoHeader(fi)
 		if err != nil {
 			log.Fatal(err)
 		}
-		header.Name = pname
+		switch charset {
+		case "GBK":
+			if base, _, err = transform.String(
+				simplifiedchinese.GBK.NewEncoder(), base); err != nil {
+				log.Fatal(err)
+			}
+		}
+		header.Name = base
+
 		if fi.IsDir() {
 			_, err := w.CreateHeader(header)
 			if err != nil {
@@ -218,18 +244,12 @@ func zipDir(pth, dst string) {
 				log.Fatal(err)
 			}
 			f.Close()
+
 			for _, name := range names {
 				if name == "." || name == ".." {
 					continue
 				}
-				abs, err := filepath.Abs(filepath.Join(p, name))
-				if err != nil {
-					log.Fatal(err)
-				}
-				if abs == dstAbs {
-					continue
-				}
-				walk(filepath.Join(p, name), path.Join(pname, name))
+				walk(filepath.Join(full, name), path.Join(base, name))
 			}
 		} else {
 			reader := bufio.NewReader(f)
@@ -250,5 +270,4 @@ func zipDir(pth, dst string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	file.Close()
 }
